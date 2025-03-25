@@ -5,9 +5,11 @@ export async function middleware(request: NextRequest) {
   // Get the path of the request
   const path = request.nextUrl.pathname
 
-  // Get the token from cookies
+  // Get both tokens from cookies
   const accessToken = request.cookies.get('access_token')?.value
-
+  const refreshToken = request.cookies.get('refresh_token')?.value
+  console.log("accessToken", accessToken);
+  console.log("refreshToken", refreshToken);
   // Define public routes that don't require authentication
   const publicRoutes = [
     '/auth/login', 
@@ -15,6 +17,7 @@ export async function middleware(request: NextRequest) {
     '/auth/reset-password',
     '/auth/forget-password',
     '/auth/verify-email',
+    '/auth/verify-token',
     '/^\/auth\/verify-email\/[^/]+$/',
     /^\/auth\/reset-password\/[^/]+$/ // This pattern matches /auth/reset-password/{token}
   ]
@@ -32,64 +35,89 @@ export async function middleware(request: NextRequest) {
     return NextResponse.next()
   }
 
-  // For protected routes, check the token
-  if (!accessToken) {
-    console.log("no access token");
+  // If both tokens are missing, redirect to login
+  if (!accessToken && !refreshToken) {
+    console.log("no tokens available");
     return NextResponse.redirect(new URL('/auth/login', request.url))
   }
 
-  // try {
-  //   // Make a request to verify the token
-  //   const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/auth/verify-token`, {
-  //     headers: {
-  //       'Authorization': `Bearer ${accessToken}`
-  //     }
-  //   });
-
-  //   if (response.status === 403) {
-  //     // If token is expired/invalid, redirect to reset password
-  //     const resetToken = response.headers.get('reset-token');
-  //     if (resetToken) {
-  //       return NextResponse.redirect(new URL(`/auth/reset-password/${resetToken}`, request.url))
-  //     }
-  //   }
-
-  //   // If token is valid, proceed
-  //   return NextResponse.next()
-  // } catch (error) {
-  //   // If there's an error, redirect to login
-  //   return NextResponse.redirect(new URL('/auth/login', request.url))
-  // }
   try {
-    const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/auth/verify-token`, {
+    // Use whichever token is available (prefer access token)
+    const tokenToUse = accessToken || refreshToken;
+    console.log('Attempting to verify/refresh token');
+    
+    const verifyResponse = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/auth/verify-token`, {
       headers: {
-        'Authorization': `Bearer ${accessToken}`
+        'Authorization': `Bearer ${tokenToUse}`
       }
     });
-    console.log("verify token response======>>>>",response);
-  
-    const data = await response.json();
-    console.log("new token data======>>>>",data);
-  
-    if (response.ok) {
-      // If a new token was issued, update it in cookies
-      if (data.newToken) {
-        const response = NextResponse.next();
-        response.cookies.set('access_token', data.newToken, {
-          httpOnly: true,
-          secure: process.env.NODE_ENV === 'production',
-          sameSite: 'lax',
+
+    console.log('Verify response status:', verifyResponse.status);
+    const responseData = await verifyResponse.json();
+    console.log('Verify response data:', responseData);
+
+    if (verifyResponse.ok && responseData.valid) {
+      const response = NextResponse.next();
+      
+      // If we got new tokens, update the cookies
+      if (responseData.newToken) {
+        console.log('Setting new access token from newToken');
+        response.cookies.set('access_token', responseData.newToken, {
           maxAge: 30 * 60, // 30 minutes
+          path: '/'
         });
-        return response;
+      } else if (!accessToken && responseData.valid && tokenToUse) {
+        // Add type check for tokenToUse
+        console.log('Setting access token from refresh token');
+        response.cookies.set('access_token', tokenToUse, {
+          maxAge: 30 * 60, // 30 minutes
+          path: '/'
+        });
       }
-      return NextResponse.next();
+      
+      if (responseData.newRefreshToken) {
+        console.log('Setting new refresh token');
+        response.cookies.set('refresh_token', responseData.newRefreshToken, {
+          maxAge: 7 * 24 * 60 * 60, // 7 days
+          path: '/'
+        });
+      }
+      
+      return response;
     }
-  
-    // If token is invalid/expired, redirect to login
-    return NextResponse.redirect(new URL('/auth/login', request.url));
+
+    if (verifyResponse.status === 403) {
+      // Handle unverified user
+      try {
+        const verifyEmailResponse = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/auth/send-verification-email`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${tokenToUse}`
+          }
+        });
+        
+        if (verifyEmailResponse.ok) {
+          const data = await verifyEmailResponse.json();
+          return NextResponse.redirect(new URL(data.verificationPageUrl, request.url));
+        }
+      } catch (error) {
+        console.error('Failed to send verification email:', error);
+      }
+    }
+
+    // If verification failed completely
+    console.log('Token verification failed');
+    const response = NextResponse.redirect(new URL('/auth/login', request.url));
+    response.cookies.delete('access_token');
+    response.cookies.delete('refresh_token');
+    return response;
+
   } catch (error) {
-    return NextResponse.redirect(new URL('/auth/login', request.url));
+    console.error('Middleware error:', error);
+    const response = NextResponse.redirect(new URL('/auth/login', request.url));
+    response.cookies.delete('access_token');
+    response.cookies.delete('refresh_token');
+    return response;
   }
 }
 
